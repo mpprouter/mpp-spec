@@ -1,0 +1,257 @@
+# Technical Doc - ROZO: Intent-Based Pay for AI Services via Stellar MPP & x402
+
+
+## 1. System Overview
+
+```text
+                       +---------------------------------------------+
+                       |        Buyer side: human or agent            |
+                       |  OpenClaw skills / agent frameworks / CLI    |
+                       |          -> Buyer SDK (BSD/MIT)           |
+                       +----------------------+----------------------+
+                                              |
+                                              | 1. GET /service -> HTTP 402 challenge
+                                              | 2. deterministic parse -> sign -> pay
+                                              v
+        +-------------------------------------------------------------+
+        |                       Stellar mainnet                        |
+        |  x402 path: Soroban auth-entry -> facilitator verify/settle  |
+        |  MPP path: classic USDC payment + nonce-memo binding         |
+        +----------------------+------------------------+-------------+
+                               |                        |
+                               v                        v
+        +-----------------------------+   +----------------------------+
+        | Intent providers / sellers   |   | Quality metrics pipeline   |
+        | - MPP Router (ROZO, first)   |   | - public Dune dashboard    |
+        | - any third-party provider   |   | - per-payer history API    |
+        |   with own key and payments  |   | - provider ranking         |
+        +-----------------------------+   +----------------------------+
+```
+
+Component-to-deliverable mapping:
+
+| Component | Deliverable | Tranche |
+|---|---|---|
+| Open spec: MPP dialect, catalog format, receipt/refund rules, provider registration | spec doc + SEP / ecosystem review submission | T1 |
+| Buyer SDK | Apache/MIT open source, including no-ROZO acceptance test | T1 |
+| Seller / provider library | open-source server library + onboarding guide | T1 |
+| MPP Router, first operator | live today at `apiserver.mpprouter.dev`; catalog declares `stellar.x402` + `stellar.mpp` on pubnet | existing |
+| Quality metrics + Dune dashboard | public dashboard + per-payer history API | T1 basic / T2 full |
+| Verified merchant network | top 10 services verified payable, each with reproducible paid call on Dune | T1 |
+| Non-ROZO intent providers | T2 >= 1 as payout gate, T3 >= 2 | T2/T3 |
+
+Two capabilities distinguish the MPP extension from exact x402: **output-metered pricing** (charge after the result exists, §2.3) and **trusted-buyer fast settlement** (< 5s confirmation for returning buyers, §2.4). Both come from the same primitive: the session.
+
+## 2. Two Payment Paths
+
+§2.1 is the unmodified official stack, summarized for completeness only. ROZO's original contributions are §2.2–§2.4.
+
+### 2.1 x402 Path: Official Fixed-Price Calls
+
+This path follows the official Stellar x402 stack. ROZO does not reinvent it.
+
+1. Service returns `HTTP 402` with a payment challenge.
+2. Buyer SDK parses deterministically.
+3. Buyer signs a **Soroban auth entry**, Stellar's equivalent pattern for authorized transfer.
+4. Facilitator, Coinbase or OpenZeppelin Relayer, verifies and settles. It can sponsor fees and remains non-custodial.
+5. Service verifies settlement and delivers.
+6. Seller-signed receipt returns.
+7. Metrics pipeline records the event.
+
+Spending limits are enforced on-chain by OpenZeppelin audited smart accounts.
+
+### 2.2 MPP / Session Path: ROZO Extension
+
+The extension has two purposes:
+
+1. **Compatibility:** today only a limited set of wallets can sign auth entries. Any wallet that can send USDC with a memo can use the MPP path.
+2. **Variable-cost pricing:** many AI/data calls have final cost only after output exists.
+
+Single-payment MPP exact flow:
+
+1. Provider creates challenge: `{ payTo, amount, asset(USDC:issuer), network, nonce, expiry, receiptWindow }`.
+2. Buyer sends a classic USDC payment with the **challenge nonce bound in the tx memo**. Long nonces use hash binding.
+3. Provider verifies through Horizon/RPC: exact amount, asset, destination, memo, and finality all match.
+4. Provider delivers, returns seller-signed receipt, and metrics record the event.
+
+Explicit edge handling:
+
+- **Replay:** nonce is single-use. Provider marks it consumed on first valid payment. Duplicate payment to the same nonce enters refund flow.
+- **Amount mismatch:** exact match is required. Overpayment or underpayment is not fulfilled and enters refund flow.
+- **Expiry:** challenge includes expiry. Late payment is refunded according to refund flow.
+
+### 2.3 MPP Sessions for Variable-Cost Calls
+
+**Why exact x402 cannot price these calls.** x402 charges at order creation: the amount is fixed inside the 402 challenge, before the request executes. For AI calls, true cost = input tokens (known at order time) + output tokens (known only after execution — and every major LLM API prices input and output separately). A pay-before-execution protocol therefore has only two options, both wrong: quote the maximum possible output (systematic overcharge) or quote a flat price (mispriced in both directions). This is not an implementation gap — it is the shape of the protocol. Exact x402 remains the right tool for fixed-price calls; MPP sessions exist precisely for the calls it cannot express: open a bounded session, meter actual output, settle actual usage.
+
+```text
+open session  ->  meter usage  ->  settle actual  ->  receipt
+(budget max)      (actual use)      (paid <= max)      (quoted max + actual)
+```
+
+1. Buyer opens a session: `{ sessionId, budgetMax, asset, expiry, settlementPolicy }`.
+2. Provider meters actual usage: output tokens, duration, or data size.
+3. Settlement amount is <= `budgetMax`.
+4. Receipt records both `quotedMax` and `actualAmount`, plus usage units.
+
+Trust model, stated explicitly in the spec:
+
+- MPP delivery and payment are **not atomically bound**. Refund is provider policy plus spec rule, not protocol-enforced.
+- If a custodial wallet rewrites the memo, MPP path does not apply.
+- The trust model is weaker than official x402 with facilitator + auth entry. The tradeoff is broader wallet/provider compatibility.
+
+### 2.4 Trusted-Buyer Fast Settlement (returning buyers, < 5s)
+
+For a first-time buyer, the MPP flow waits for on-chain finality (~5s) plus provider verification before delivery. For a **returning buyer with verifiable on-chain payment history**, the provider can decouple confirmation from settlement:
+
+1. **Instant confirmation.** Based on the buyer's on-chain history, the provider extends a small pre-approved allowance (bounded per call and per buyer). The call is confirmed and delivered in **under 5 seconds** — before the payment transaction reaches finality.
+2. **Deferred settlement.** The settling transaction lands on-chain seconds behind. The chain remains the source of truth: the receipt binds delivery to the settling tx hash once it lands.
+3. **Batched netting (session mode).** Within a session, N calls settle as a single on-chain transaction. Per-call marginal confirmation is a metered ledger update (milliseconds); the session settles `actualAmount <= budgetMax` in one payment.
+
+Trust model: the allowance is **operator risk, not buyer risk**. If settlement fails, the provider bears the loss, the allowance is revoked, and the buyer is downgraded back to exact-payment mode. Allowance bounds (per-call cap and per-buyer outstanding cap) are declared at provider registration.
+
+## 3. Spec Field Definitions, v1 Draft
+
+### 3.1 MPP Challenge
+
+| Field | Type | Description |
+|---|---|---|
+| `payTo` | G-address | provider-owned receiving key |
+| `amount` | string | exact amount; in session mode this is `budgetMax` |
+| `asset` | string | `USDC:<issuer>` |
+| `network` | string | `stellar:pubnet` |
+| `nonce` | string | single-use, request-bound; long nonce hash-bound into memo |
+| `expiry` | ISO8601 | challenge expiry time |
+| `receiptWindow` | seconds | delivery/receipt deadline; timeout = non-delivery |
+
+### 3.2 Seller-Signed Receipt
+
+| Field | Description |
+|---|---|
+| `txHash` | on-chain transaction hash |
+| `nonce` | corresponding challenge |
+| `deliveryStatus` | delivered / non-delivery / refunded |
+| `quotedMax` / `actualAmount` | both present for session mode; equal for exact mode |
+| `units` | billing units, such as tokens / seconds / bytes, if applicable |
+| `timestamp` | delivery time |
+| `signature` | SEP-10-style signature by the **provider's own Stellar key**; receipt is seller-attested, not ROZO-attested |
+
+Anyone can verify a receipt independently using the provider public key.
+
+### 3.3 Provider Registration
+
+| Field | Description |
+|---|---|
+| `name` / `endpoint` / `vertical` | service identity and category: AI inference or blockchain/data |
+| `payTo` | provider receiving address; provider keeps its key; delegated signing / scoped operational keys supported |
+| `schemes` | supported dialects: `stellar.x402` / `stellar.mpp` |
+| `pricing` | fixed / per-unit / session |
+| `refundPolicy` | provider-specific declaration on top of default spec rules |
+
+Registration is **self-service and pluggable**: a provider onboards by pointing its own domain/endpoint at the spec — no permission from ROZO required — and its catalog entry goes live automatically. The public catalog addresses the agent resource discovery gap, and every entry enters the Dune indexing set and the open provider scorecard (§6.2).
+
+## 4. Pricing Model: Exact vs Session
+
+| | Exact x402, official | MPP session, extension |
+|---|---|---|
+| Best for | fixed-price calls where price is known | variable-cost calls where cost depends on output |
+| Typical scenarios | fixed-price APIs, per-call queries | LLM output tokens, browser duration, data job return size |
+| Charge timing | at order creation — amount fixed in the 402 challenge, before output exists | after execution — session opened with `budgetMax`, actual output metered, settle actual |
+| Buyer cost | provider quotes maximum possible output, causing systematic overpayment | paid amount = actual usage |
+| Example | fixed $0.05 endpoint | LLM quoted max $0.20 for 4K output tokens, actual output 1.1K, settles $0.06 |
+
+Positioning: sessions are an **extension** to official x402, not a replacement. Fixed-price endpoints keep using exact x402.
+
+## 5. Security Model
+
+First principle: **no LLM constructs or modifies a payment transaction.**
+
+The LLM may express intent. Amount, destination, asset, memo, nonce, expiry, and receipt window are built deterministically by the SDK from challenge fields. The key holder signs. In agent contexts, the model decides whether to buy, never what the payment contains.
+
+| Control | Mechanism | Enforcement Layer |
+|---|---|---|
+| Agent spend cap | default agent deployment uses a sub-account holding only the daily budget, default $5/day | on-chain balance |
+| x402 path spend cap | OpenZeppelin audited smart accounts with spending limits / scoped permissions | on-chain contract |
+| Human confirmation | above $10 (default) requires human approval; human is policy-setter/auditor | SDK policy |
+| Allowlist | service / provider allowlist | SDK policy |
+| Idempotency | client-side idempotency key | SDK |
+| Replay prevention | single-use nonce + expiry | provider |
+| Refund-on-non-delivery | objective non-delivery: HTTP 5xx, timeout, or empty response within receipt window; refund to paying key; operator bears loss | spec + provider |
+| Trusted-buyer allowance | bounded per-call cap + per-buyer outstanding cap; revoked on settlement failure; operator bears loss (§2.4) | provider policy + spec |
+| Sponsored fee abuse model | only keys with >= $1 USDC; per-key daily cap; global sponsorship budget and circuit breaker; abusive keys delisted | operator |
+| Order state machine | created -> paid -> delivered / non-delivery -> refunded | spec |
+
+Content refusal / policy refusal counts as delivered by default unless the provider declares a different policy during registration.
+
+## 6. Quality Metrics and Verification
+
+### 6.1 Indexing Methodology
+
+- **MPP path:** index USDC payments to spec-registered seller addresses where memo matches the spec nonce format. Registration is open and free, so ROZO and non-ROZO sellers are indexed equally.
+- **x402 path:** best-effort indexing of transactions settled through publicly identifiable facilitator accounts (source accounts + Soroban events). Where this proves unreliable, v1 metrics scope is registered sellers plus submitted receipts — a receipt is first-class evidence on its own (§3.2) and does not depend on Dune.
+- **Honesty boundary:** only registered sellers and facilitator-settled traffic are indexed. We do not claim to cover unregistered payments.
+- **Integrity:** ROZO-owned and test keys are published and excluded from KPIs. Subsidy- or referral-driven cohorts are labeled. Traffic violating integrity rules can be rejected during tranche review.
+
+### 6.2 Metrics
+
+Headline: **settlement time**.
+
+- First-time buyer: payment / settlement / delivery-state visibility target P95 < 10s.
+- Returning buyer (trusted-buyer fast settlement, §2.4): confirmation **< 5s**, with on-chain settlement following seconds behind or netted per session.
+
+Current state: 95% of cross-chain orders into Stellar are around ~20 seconds. These targets do not include upstream model runtime.
+
+Other metrics:
+
+- transaction count
+- USDC volume
+- unique external payers
+- per-service mix
+- non-ROZO provider share
+- p95 latency
+- success rate
+- refund rate
+- failure type
+- cost per comparable task
+
+Per-payer history is provided through an **API / query capability**, not a heavy dashboard: payer address -> paid calls, tx hash, service, quoted vs actual, delivery/refund state, receipt.
+
+**Open provider scorecard.** Every catalog provider gets a public scorecard, published alongside its catalog entry, so any buyer — human or agent — can compare and rank providers before paying:
+
+- **Speed:** p50/p95 end-to-end latency per service.
+- **Price:** declared unit price (per call / per token / per second) and observed cost per comparable task.
+- **Cache:** whether cached pricing is offered, observed cache hit rate, and the cached-call discount.
+- **Reliability:** success rate, refund rate, uptime.
+
+Scorecard inputs come from on-chain settlement data plus open probes against the provider's declared endpoint. The methodology is public: anyone can re-measure and rebuild the ranking independently.
+
+### 6.3 P95 < 10s Budget, Payment Layer Only
+
+| Stage | Target |
+|---|---|
+| challenge parse + construct + sign | < 1s |
+| native Stellar confirmation | ~5s finality |
+| provider verification through Horizon/RPC | < 2s |
+| delivery-state / receipt visibility | < 2s |
+
+Cross-chain top-up through Rozo Intents is currently ~20s at p95 and continues to improve. Prefunded fulfillment can make the user experience visible before upstream settlement fully completes.
+
+For returning buyers, trusted-buyer fast settlement (§2.4) removes the on-chain wait from the critical path entirely: confirmation in under 5 seconds, settlement seconds behind or netted per session.
+
+## 7. Reviewer-Reproducible Acceptance Tests
+
+1. **No-ROZO acceptance test, T1:** Buyer SDK completes a paid call against a non-ROZO spec-compliant endpoint with no ROZO server, router, or account in the loop. Execution record is public.
+2. **Top 10 verified payable, T1:** each initial service has one reviewer-reproducible paid call, evidenced by a public receipt and, where indexed, the public Dune dashboard.
+3. **Receipt independent verification:** any receipt can be verified offline with the provider public key.
+4. **Non-ROZO provider, T2/T3 gate:** third party deploys with seller library, holds its own key, generates real external volume, and appears with operator attribution on the dashboard.
+
+The no-ROZO acceptance test can also produce the live-demo artifact for the video if recorded in one clean mainnet take.
+
+## 8. Dependencies and Failure Surfaces
+
+| Dependency | Failure Impact | Mitigation |
+|---|---|---|
+| Official facilitators, Coinbase / OZ Relayer | x402 path temporarily unavailable | MPP path has no facilitator dependency and remains payable |
+| Stripe/Tempo gateways | gateway-routed services may lose payable status | first-party services and OpenRouter path unaffected; provider interface can onboard replacements; spec/SDK/metrics are gateway-agnostic |
+| MPP Router operated by ROZO | ROZO operator offline | spec + SDK + provider library are open; non-ROZO providers continue serving |
+| Dune | dashboard unavailable | indexing rules are public; anyone can rebuild from on-chain data; receipts remain independently verifiable without Dune |
