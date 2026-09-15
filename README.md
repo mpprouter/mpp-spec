@@ -203,18 +203,37 @@ Before answering 200 the router verifies on-chain:
 offer. The registered channel then becomes a row in the MPP store rather than
 a constant.
 
-**Implementation status (2026-09-15).** §3.4 is the target. The Router today
-verifies the on-chain side of registration (WASM hash, `to` / `token` /
-`commitment_key` / `refund_waiting_period` getters, balance, close state).
-Not yet implemented, tracked against this text:
+**Implementation status (2026-09-15, updated the same day).** §3.4 is
+implemented by this Router on the metered channel endpoints
+(`/v1/playground/channel/{chat,blend-activity,tx-decode}`), verified on
+pubnet against factory `CCR2HE6C…` (rozo-mpprouter #163, #164):
 
-1. the 402 does not emit a `scheme: "channel"` offer; the parameters are only
-   in `GET /v1/playground/config`
-2. `register` takes `{ channel_contract, funder, commitment_key, token,
-   network, deposit_raw }` and no `salt`, so it does not recompute the
-   deterministic deploy address
-3. the request is not authenticated as `from`; the Router relies on the
-   on-chain read plus per-IP rate limiting, and re-registration is idempotent
+1. **Channel offer.** Every 402 those endpoints issue (`channel_not_registered`,
+   `insufficient_channel_balance`, and the voucher challenge) carries an
+   x402 envelope `{ x402Version: 2, resource, accepts: [ { scheme: "channel",
+   network, asset, payTo, amount, extra: { factory, wasmHash,
+   refundWaitingPeriodMinLedgers: 100, register, minDeposit } } ] }` in the
+   JSON **body**, next to the mppx `WWW-Authenticate` challenge. `amount` is
+   this call's voucher increment. The same object is `channel.offer` in
+   `GET /v1/playground/config`. The offer is not placed in the x402
+   `Payment-Required` header: mppx 0.7.0 clients decode that whole header
+   against an `exact`-and-EVM-only schema and discard the mppx challenge when
+   any other entry is present, which would break every existing channel
+   client on its first probe.
+2. **Registration** takes the spec body `{ channel, commitmentKey, salt, from,
+   signature }` and recomputes the factory's deterministic address
+   (`sha256(xdr(DeploymentSaltPreimage(from, salt)))` as the deployer salt,
+   standard contract-id preimage); a mismatch is `400 address_mismatch`. The
+   legacy playground body is still accepted for the frontend until it
+   migrates.
+3. **Authentication as `from`.** `signature` is `from`'s ed25519 signature
+   over `mpprouter.channel-register.v1\n<channel>\n<commitmentKey>\n<salt hex>\n<from>`,
+   as a raw signature or a SEP-53 signed message; missing or wrong is `401`.
+   Re-registration of the same tuple stays idempotent.
+
+Not covered: the paid proxy (`/v1/services/*`) still advertises only `exact`.
+Its channel branch reads an operator-managed registry, so a self-registered
+channel would not be honored there and the offer is deliberately not made.
 
 #### 3.4.1 Recipient obligation before delivering value
 
