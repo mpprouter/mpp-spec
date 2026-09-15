@@ -35,7 +35,7 @@ Component-to-deliverable mapping:
 | Open spec: MPP dialect, catalog format, receipt/refund rules, provider registration | spec doc + SEP / ecosystem review submission | T1 |
 | Buyer SDK | Apache/MIT open source, including no-ROZO acceptance test | T1 |
 | Seller / provider library | open-source server library + onboarding guide | T1 |
-| MPP Router, first operator | live today at `apiserver.mpprouter.dev`; catalog declares `stellar.x402` + `stellar.mpp` on pubnet | existing |
+| MPP Router, first operator | live today at `apiserver.mpprouter.dev`; catalog declares `stellar.x402` + `stellar.mpp` on pubnet; implements the §3.4 channel offer and channel registration on pubnet since 2026-09-15 | existing |
 | Quality metrics + Dune dashboard | public dashboard + per-payer history API | T1 basic / T2 full |
 | Verified merchant network | top 10 services verified payable, each with reproducible paid call on Dune | T1 |
 | Non-ROZO intent providers | T2 >= 1 as payout gate, T3 >= 2 | T2/T3 |
