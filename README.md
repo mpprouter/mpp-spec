@@ -150,6 +150,100 @@ Anyone can verify a receipt independently using the provider public key.
 
 Registration is **self-service and pluggable**: a provider onboards by pointing its own domain/endpoint at the spec — no permission from ROZO required — and its catalog entry goes live automatically. The public catalog addresses the agent resource discovery gap, and every entry enters the Dune indexing set and the open provider scorecard (§6.2).
 
+### 3.4 Channel Offer and Channel Registration
+
+A router serving many agents cannot be configured with a channel before the
+agent opens it: `stellar.channel({ channel, commitmentKey })` names ONE
+deployed channel. Two additions close that loop — one field group on the 402,
+one endpoint — and the per-call flow is unchanged MPP.
+
+**Channel offer** — an additional entry in the 402's `accepts[]`:
+
+| Field | Description |
+|---|---|
+| `scheme` | `channel` |
+| `network` | `stellar:pubnet` |
+| `asset` | the SAC the channel holds, e.g. the USDC SAC `CCW67TSZ…` |
+| `payTo` | the recipient (`to`) the channel is constructed with |
+| `extra.factory` | the router's channel factory, e.g. `CCR2HE6C…` on pubnet |
+| `extra.wasmHash` | the code hash the factory deploys, e.g. `d6717aa8…` |
+| `extra.refundWaitingPeriodMinLedgers` | `100` for this Router (§3.4.2) |
+| `extra.register` | where the agent announces a freshly opened channel |
+| `extra.minDeposit` | human-readable amount in `asset` |
+
+`extra.wasmHash` is not a trust anchor on its own. The factory already refuses
+to deploy any hash but the one it stores, so against an honest factory the
+field is redundant; and a hostile 402 can advertise a hostile factory *and* a
+matching hash. Its use is for a client holding an independent pin — one read
+from the factory's own `WasmHash` storage entry, say — to compare against.
+Note also that the factory pins the **code, not the parameters**: `token`,
+`from`, `to` and `commitment_key` are arguments to `open`, so a channel from
+the right code can still name the wrong recipient or asset. That is why
+registration reads the getters rather than trusting provenance.
+
+**Channel registration** — `POST {extra.register}`:
+
+```json
+{ "channel": "C…", "commitmentKey": "G…", "salt": "<hex>", "from": "G…" }
+```
+
+`salt` and `from` are required: without them the router cannot recompute the
+deterministic deploy address, and cannot authenticate the request.
+
+Before answering 200 the router verifies on-chain:
+
+1. the address is what `factory` deploys for that `salt`;
+2. the instance's code hash equals the factory's stored `WasmHash` — code and provenance checked separately;
+3. `to()` == `payTo`, `token()` == `asset`, `commitment_key()` == `commitmentKey`, `refund_waiting_period()` as required (§3.4.2);
+4. `balance()` >= `minDeposit`;
+5. the channel's close state and, if closing, the effective ledger — a channel already counting down offers less than the full window;
+6. the request is authenticated as `from`. Without this anyone can bind a channel whose identifiers are public, grief the real agent, and leave its deposit locked for a window.
+
+4xx with a reason on any failed check; the agent falls back to the `exact`
+offer. The registered channel then becomes a row in the MPP store rather than
+a constant.
+
+#### 3.4.1 Recipient obligation before delivering value
+
+Per call the agent sends the usual voucher `{ action: "voucher", amount,
+signature }` over the cumulative amount. Before delivering value the recipient
+MUST do both:
+
+- verify the ed25519 signature **strictly** (`verify_strict`; the chain refuses small-order keys), **and**
+- check the commitment's cumulative amount against live `balance()` and `withdrawn()`.
+
+These are not alternatives, and the second is not about `settle` reverting.
+`withdraw` pays `owed.min(balance)`: a commitment for more than the channel
+holds does **not** fail — `settle` succeeds and silently pays short. A
+signature that verifies perfectly can still leave the recipient underpaid,
+which is why the channel contract's own recipient expectations require
+verifying that each commitment's amount is less than the channel's balance.
+
+Note for implementers: `settle` carries no close check. It remains callable
+throughout the refund window and after the close is effective, up until
+`refund` drains the balance.
+
+#### 3.4.2 Refund waiting period
+
+`close_start` begins a wait of `refund_waiting_period` ledgers before the
+funder may `refund`; that window is the recipient's only chance to submit the
+latest voucher. Measured over 199 consecutive pubnet ledgers, mean close time
+is **5.60 s**, so 100 ledgers is about **9.3 minutes**.
+
+This Router requires **exactly 100** and enforces it at registration the same
+way it enforces the WASM hash, settles from a 2-minute cron that fences a
+channel on the first tick observing `close_start` and retries every tick until
+submission lands (about 4.6 ticks inside the window), and refuses to pay
+upstream on a channel that has entered `close_start`, bounding exposure to
+vouchers already served. Its design floor is 60 ledgers — two cron ticks plus
+settle latency. A spec needing a single number should use 100.
+
+A recipient adopting a different value should derive it the same way: the
+window must clear its own close-monitoring interval plus settle latency plus
+retries, and the channel contract places that verification on the recipient
+at channel creation.
+
+
 ## 4. Pricing Model: Exact vs Session
 
 | | Exact x402, official | MPP session, extension |
