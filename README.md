@@ -203,6 +203,19 @@ Before answering 200 the router verifies on-chain:
 offer. The registered channel then becomes a row in the MPP store rather than
 a constant.
 
+**Implementation status (2026-09-15).** §3.4 is the target. The Router today
+verifies the on-chain side of registration (WASM hash, `to` / `token` /
+`commitment_key` / `refund_waiting_period` getters, balance, close state).
+Not yet implemented, tracked against this text:
+
+1. the 402 does not emit a `scheme: "channel"` offer; the parameters are only
+   in `GET /v1/playground/config`
+2. `register` takes `{ channel_contract, funder, commitment_key, token,
+   network, deposit_raw }` and no `salt`, so it does not recompute the
+   deterministic deploy address
+3. the request is not authenticated as `from`; the Router relies on the
+   on-chain read plus per-IP rate limiting, and re-registration is idempotent
+
 #### 3.4.1 Recipient obligation before delivering value
 
 Per call the agent sends the usual voucher `{ action: "voucher", amount,
