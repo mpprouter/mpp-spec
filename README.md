@@ -381,3 +381,7 @@ The no-ROZO acceptance test can also produce the live-demo artifact for the vide
 | Stripe/Tempo gateways | gateway-routed services may lose payable status | first-party services and OpenRouter path unaffected; provider interface can onboard replacements; spec/SDK/metrics are gateway-agnostic |
 | MPP Router operated by ROZO | ROZO operator offline | spec + SDK + provider library are open; non-ROZO providers continue serving |
 | Dune | dashboard unavailable | indexing rules are public; anyone can rebuild from on-chain data; receipts remain independently verifiable without Dune |
+
+## Secret scanning
+
+Enable the local gitleaks pre-commit hook once per clone: `brew install gitleaks pre-commit && pre-commit install` (config in `.pre-commit-config.yaml`). CI also runs a report-only scan in `.github/workflows/secret-scan.yml`.
